@@ -1,0 +1,26 @@
+version: "3.9"
+services:
+  api:
+    build: .
+    container_name: sleepmind-api
+    ports: ["8080:8080"]
+    volumes: ["./outputs:/app/outputs"]
+    env_file: .env
+    environment:
+      - STORAGE_DIR=/app/outputs/store
+      - FAISS_DIR=/app/outputs/faiss
+
+  dashboard:
+    build: .
+    container_name: sleepmind-dashboard
+    depends_on: [api]
+    command: >
+      sh -c "pip install streamlit httpx &&
+             streamlit run sleepmind_ai/dashboard/app.py
+             --server.port 8501 --server.address 0.0.0.0"
+    ports: ["8501:8501"]
+    volumes: ["./outputs:/app/outputs"]
+    env_file: .env
+    environment:
+      - STORAGE_DIR=/app/outputs/store
+      - API_URL=http://api:8080

@@ -1,0 +1,13 @@
+chat_model: "gpt-4o-mini"
+embedding_model: "text-embedding-3-small"
+temperature: 0.2
+chunk_size: 800
+chunk_overlap: 120
+faq_count: 20
+predicted_question_count: 15
+agent_max_retries: 2
+agent_timeout_sec: 120.0
+top_k_chunks: 5
+top_k_faqs: 3
+top_k_predicted: 3
+run_version: "1.0.0"
