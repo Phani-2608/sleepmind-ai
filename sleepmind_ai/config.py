@@ -14,7 +14,7 @@ class SleepMindConfig:
     embedding_model: str = "text-embedding-3-small"
     temperature: float = 0.2
     max_tokens_answer: int = 1500
-    max_tokens_agent: int = 2000
+    max_tokens_agent: int = 4096
 
     # PDF Ingestion
     chunk_size: int = 800
