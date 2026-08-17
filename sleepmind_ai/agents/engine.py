@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from openai import OpenAI
@@ -20,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 
 class SleepTimeComputeEngine:
-    """Orchestrates all four sleep-time agents sequentially."""
+    """Orchestrates all four sleep-time agents.
+
+    The four agents are independent — each only reads the raw document
+    text and doesn't depend on any other agent's output — so they run
+    concurrently instead of one after another. This turns total wait
+    time from "sum of all four calls" into "roughly the slowest one".
+    """
 
     def __init__(self, cfg: SleepMindConfig):
         self.cfg = cfg
@@ -37,20 +44,32 @@ class SleepTimeComputeEngine:
         self.total_elapsed: float = 0.0
 
     def run_all(self, raw_text: str) -> dict[str, Any]:
-        logger.info("Sleep-time compute starting...")
+        logger.info("Sleep-time compute starting (4 agents running concurrently)...")
         t0 = time.time()
 
-        logger.info("[1/4] SummaryAgent")
-        self.summary = self.summary_agent.run(raw_text)
+        jobs = {
+            "summary": self.summary_agent,
+            "faqs": self.faq_agent,
+            "predicted_queries": self.query_predictor,
+            "knowledge_graph_data": self.concept_extractor,
+        }
 
-        logger.info("[2/4] FAQGeneratorAgent")
-        self.faqs = self.faq_agent.run(raw_text)
+        results: dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(agent.run, raw_text): name for name, agent in jobs.items()
+            }
+            for future in futures:
+                name = futures[future]
+                logger.info("Waiting on %s...", name)
+            for future, name in futures.items():
+                results[name] = future.result()
+                logger.info("%s finished.", name)
 
-        logger.info("[3/4] FutureQueryPredictorAgent")
-        self.predicted_queries = self.query_predictor.run(raw_text)
-
-        logger.info("[4/4] ConceptExtractorAgent")
-        self.knowledge_graph_data = self.concept_extractor.run(raw_text)
+        self.summary = results["summary"]
+        self.faqs = results["faqs"]
+        self.predicted_queries = results["predicted_queries"]
+        self.knowledge_graph_data = results["knowledge_graph_data"]
 
         self.total_elapsed = round(time.time() - t0, 2)
         logger.info("Sleep-time compute complete in %.2fs", self.total_elapsed)
