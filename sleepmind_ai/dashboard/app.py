@@ -1,145 +1,212 @@
-"""Streamlit dashboard for SleepMind AI.
+"""SleepMind AI - simple, non-technical web app.
+
+Three plain steps: add a document, wait a moment while it's read,
+then ask questions about it in your own words.
 
 Run with:  streamlit run sleepmind_ai/dashboard/app.py
 """
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
+import time
 
-import pandas as pd
+import httpx
 import streamlit as st
 
-st.set_page_config(page_title="SleepMind AI", layout="wide", page_icon="🌙")
+st.set_page_config(page_title="SleepMind AI", layout="centered", page_icon="🌙")
+
+API_URL = os.environ.get("API_URL", "http://localhost:8080")
+
+# ---------------------------------------------------------------------------
+# Look & feel
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+        .main > div { max-width: 760px; margin: 0 auto; }
+        h1 { font-size: 2.1rem !important; }
+        .step-badge {
+            display: inline-block; background: #eef2ff; color: #4338ca;
+            border-radius: 999px; padding: 2px 12px; font-size: 0.85rem;
+            font-weight: 600; margin-bottom: 6px;
+        }
+        .answer-box {
+            background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px;
+            padding: 20px 22px; font-size: 1.05rem; line-height: 1.55;
+        }
+        .subtle { color: #64748b; font-size: 0.9rem; }
+        div.stButton > button {
+            border-radius: 10px; font-weight: 600; padding: 0.5rem 1.2rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+defaults = {
+    "stage": "upload",  # upload -> preparing -> ready
+    "doc_summary": None,
+    "history": [],  # list of (question, answer_dict)
+    "error": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
-def _load_json(path: str):
-    p = Path(path)
-    if not p.exists():
-        return None
-    return json.loads(p.read_text())
+def reset_all():
+    for k, v in defaults.items():
+        st.session_state[k] = v
 
 
-def main():
-    st.title("🌙 SleepMind AI: Sleep-Time Compute Dashboard")
+def api_post(path: str, **kwargs):
+    """POST to the API with a generous timeout (the free hosting tier can
+    take up to a minute to wake up if it's been idle)."""
+    with httpx.Client(timeout=180) as client:
+        return client.post(f"{API_URL}{path}", **kwargs)
 
-    store_dir = os.environ.get("STORAGE_DIR", "outputs/store")
 
-    summary = _load_json(os.path.join(store_dir, "summary.json"))
-    faqs = _load_json(os.path.join(store_dir, "faqs.json"))
-    predicted = _load_json(os.path.join(store_dir, "predicted_queries.json"))
-    kg_data = _load_json(os.path.join(store_dir, "knowledge_graph.json"))
-    session = _load_json(os.path.join(store_dir, "session_metadata.json"))
-    benchmark_path = os.path.join(store_dir, "benchmark_results.csv")
+def _friendly_error(response: httpx.Response) -> str:
+    try:
+        detail = response.json().get("detail", "")
+    except Exception:
+        detail = ""
+    if "api key" in detail.lower():
+        return "The server isn't set up with an AI key yet."
+    return "Please try again."
 
-    if summary is None:
-        st.warning(
-            "No artifacts found. Run the pipeline first: `python -m sleepmind_ai.pipeline --pdf paper.pdf`"
-        )
-        return
 
-    # KPIs
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("FAQs generated", len(faqs) if faqs else 0)
-    c2.metric("Predicted queries", len(predicted) if predicted else 0)
-    sleep_sec = session.get("total_sleep_time_sec", "?") if session else "?"
-    c3.metric("Sleep-time compute", f"{sleep_sec}s")
-    kg_nodes = len(kg_data.get("concepts", [])) + len(kg_data.get("entities", [])) if kg_data else 0
-    c4.metric("KG nodes", kg_nodes)
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.title("🌙 SleepMind AI")
+st.write(
+    "Upload a document, and ask questions about it in plain English. "
+    "SleepMind reads the whole thing in advance, so its answers are fast "
+    "and grounded in what's actually written."
+)
+st.divider()
 
-    tabs = st.tabs(["Summary", "FAQs", "Predicted Queries", "Knowledge Graph", "Benchmark"])
+# ---------------------------------------------------------------------------
+# Stage 1 — Upload
+# ---------------------------------------------------------------------------
+if st.session_state.stage == "upload":
+    st.markdown('<span class="step-badge">Step 1 of 2</span>', unsafe_allow_html=True)
+    st.subheader("Add your document")
+    st.caption("Works best with a written PDF up to a few dozen pages — a report, paper, or manual.")
 
-    with tabs[0]:
-        st.subheader("Paper Summary")
-        st.markdown(f"**{summary.get('one_line_summary', '')}**")
-        st.write(summary.get("executive_summary", ""))
-        st.subheader("Main Contributions")
-        for c in summary.get("main_contributions", []):
-            st.write(f"- {c}")
-        st.subheader("Limitations")
-        for lim in summary.get("limitations", []):
-            st.write(f"- {lim}")
+    uploaded = st.file_uploader("Choose a PDF file", type=["pdf"], label_visibility="collapsed")
 
-    with tabs[1]:
-        st.subheader("Pre-generated FAQs (Sleep-Time Artifacts)")
-        if faqs:
-            for faq in faqs:
-                with st.expander(f"Q{faq.get('id', '?')}: {faq.get('question', '')}"):
-                    st.write(faq.get("answer", ""))
-                    st.caption(
-                        f"Category: {faq.get('category', '?')} | Difficulty: {faq.get('difficulty', '?')}"
+    if uploaded is not None:
+        st.session_state.error = None
+        with st.status("Reading your document...", expanded=True) as status:
+            try:
+                files = {"file": (uploaded.name, uploaded.getvalue(), "application/pdf")}
+                r = api_post("/upload", files=files)
+                if r.status_code != 200:
+                    status.update(label="Something went wrong.", state="error")
+                    st.session_state.error = (
+                        f"The upload didn't go through ({r.status_code}). "
+                        f"{_friendly_error(r)}"
                     )
+                else:
+                    ingest = r.json()
+                    status.update(label="Document read. Getting ready to answer questions...", state="running")
 
-    with tabs[2]:
-        st.subheader("Predicted Future Queries (Sleep-Time Artifacts)")
-        if predicted:
-            for p in predicted:
-                with st.expander(
-                    f"#{p.get('rank', '?')}: {p.get('question', '')} (likelihood {p.get('likelihood_score', '?')})"
-                ):
-                    st.write(p.get("predicted_answer", ""))
-                    st.caption(f"Audience: {p.get('audience', '?')} | {p.get('rationale', '')}")
-
-    with tabs[3]:
-        st.subheader("Knowledge Graph")
-        if kg_data:
-            concepts = kg_data.get("concepts", [])
-            entities = kg_data.get("entities", [])
-            rels = kg_data.get("relationships", [])
-            st.write(
-                f"{len(concepts)} concepts, {len(entities)} entities, {len(rels)} relationships"
-            )
-            if concepts:
-                st.dataframe(
-                    pd.DataFrame(concepts)[["id", "name", "type", "importance"]].head(20),
-                    use_container_width=True,
+                    r2 = api_post("/preprocess")
+                    if r2.status_code != 200:
+                        status.update(label="Something went wrong while preparing.", state="error")
+                        st.session_state.error = (
+                            f"Preparation failed ({r2.status_code}). {_friendly_error(r2)}"
+                        )
+                    else:
+                        prep = r2.json()
+                        status.update(label="Ready!", state="complete")
+                        st.session_state.doc_summary = {
+                            "filename": uploaded.name,
+                            "pages": ingest.get("pdf_metadata", {}).get("page_count", "?"),
+                            "sections": ingest.get("total_chunks", "?"),
+                            "prep_seconds": prep.get("sleep_time_sec", "?"),
+                            "faq_count": prep.get("faq_count", 0),
+                        }
+                        st.session_state.stage = "ready"
+                        time.sleep(0.4)
+                        st.rerun()
+            except httpx.TimeoutException:
+                status.update(label="Taking longer than expected.", state="error")
+                st.session_state.error = (
+                    "The server didn't respond in time. Free hosting can take a "
+                    "minute to wake up after being idle — please try uploading again."
                 )
-        else:
-            st.info("No knowledge graph data available.")
-
-    with tabs[4]:
-        st.subheader("Benchmark: Traditional RAG vs Sleep-Time RAG")
-        if os.path.exists(benchmark_path):
-            df = pd.read_csv(benchmark_path)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Avg Traditional latency", f"{df['trad_latency'].mean():.2f}s")
-            c2.metric("Avg Sleep-Time latency", f"{df['sleep_latency'].mean():.2f}s")
-            c3.metric(
-                "Avg extra sources (Sleep)",
-                f"+{(df['sleep_sources'] - df['trad_sources']).mean():.1f}",
-            )
-            st.bar_chart(df[["trad_latency", "sleep_latency"]])
-            st.bar_chart(df[["trad_tokens", "sleep_tokens"]])
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("No benchmark results yet. Run with `--benchmark` flag.")
-
-    # Interactive QA (requires running API)
-    st.divider()
-    st.subheader("Ask a question")
-    st.caption("Requires the API to be running: `uvicorn sleepmind_ai.api.service:app --port 8080`")
-    question = st.text_input("Your question:")
-    pipeline = st.radio("Pipeline", ["sleep_time", "traditional", "compare"], horizontal=True)
-    if st.button("Ask") and question:
-        import httpx
-
-        try:
-            base = os.environ.get("API_URL", "http://localhost:8080")
-            if pipeline == "compare":
-                r = httpx.post(f"{base}/compare", json={"question": question}, timeout=60)
-            else:
-                r = httpx.post(
-                    f"{base}/query", json={"question": question, "pipeline": pipeline}, timeout=60
+            except httpx.RequestError:
+                status.update(label="Couldn't connect.", state="error")
+                st.session_state.error = (
+                    "Couldn't reach the server. Please check your connection and try again."
                 )
-            if r.status_code == 200:
-                st.json(r.json())
-            else:
-                st.error(f"API error {r.status_code}: {r.text}")
-        except Exception as e:
-            st.error(f"Could not reach the API at {base}: {e}")
 
+    if st.session_state.error:
+        st.error(st.session_state.error)
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Stage 2 — Ready to ask
+# ---------------------------------------------------------------------------
+elif st.session_state.stage == "ready":
+    doc = st.session_state.doc_summary
+    st.markdown('<span class="step-badge">Step 2 of 2</span>', unsafe_allow_html=True)
+    st.subheader("Ask anything about your document")
+    st.caption(
+        f"📄 **{doc['filename']}** — {doc['pages']} pages, read in {doc['prep_seconds']}s. "
+        "Ask as many questions as you like."
+    )
+
+    question = st.text_input(
+        "Your question", placeholder="e.g. What is the main finding of this document?",
+        label_visibility="collapsed",
+    )
+    col1, col2 = st.columns([1, 1])
+    ask_clicked = col1.button("Ask", type="primary", use_container_width=True)
+    col2.button("Upload a different document", on_click=reset_all, use_container_width=True)
+
+    if ask_clicked and question.strip():
+        with st.spinner("Thinking..."):
+            try:
+                r = api_post("/query", json={"question": question, "pipeline": "sleep_time"})
+                if r.status_code == 200:
+                    result = r.json()
+                    st.session_state.history.insert(0, (question, result, None))
+                else:
+                    st.session_state.history.insert(
+                        0, (question, None, f"Couldn't get an answer ({r.status_code}). {_friendly_error(r)}")
+                    )
+            except httpx.TimeoutException:
+                st.session_state.history.insert(
+                    0, (question, None, "That took too long — please try asking again.")
+                )
+            except httpx.RequestError:
+                st.session_state.history.insert(
+                    0, (question, None, "Couldn't reach the server. Please try again.")
+                )
+
+    st.write("")
+
+    for q, result, err in st.session_state.history:
+        st.markdown(f"**You asked:** {q}")
+        if err:
+            st.error(err)
+        else:
+            st.markdown(f'<div class="answer-box">{result.get("answer", "")}</div>', unsafe_allow_html=True)
+            sources = (
+                len(result.get("retrieved_chunks", []))
+                + len(result.get("retrieved_faqs", []))
+                + len(result.get("retrieved_predictions", []))
+            )
+            st.markdown(
+                f'<p class="subtle">Answered in {result.get("latency_sec", "?")}s, '
+                f"drawing on {sources} parts of the document.</p>",
+                unsafe_allow_html=True,
+            )
+        st.divider()
