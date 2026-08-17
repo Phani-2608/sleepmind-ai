@@ -1,0 +1,15 @@
+name: Keep SleepMind API Warm
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://sleepmind-ai-api.onrender.com/health)
+          echo "Health check responded with status: $STATUS"
