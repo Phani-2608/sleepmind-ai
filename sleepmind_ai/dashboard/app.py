@@ -3,6 +3,11 @@
 Three plain steps: add a document, wait a moment while it's read,
 then ask questions about it in your own words.
 
+The API runs on a free hosting tier that sleeps after 15 minutes of
+inactivity, so every call goes through ApiClient, which wakes the
+backend with a cheap health check and retries transient edge failures
+rather than giving up on the first one. See api_client.py.
+
 Run with:  streamlit run sleepmind_ai/dashboard/app.py
 """
 
@@ -14,9 +19,12 @@ import time
 import httpx
 import streamlit as st
 
+from .api_client import ApiClient, ApiUnavailable, friendly_error
+
 st.set_page_config(page_title="SleepMind AI", layout="centered", page_icon="🌙")
 
 API_URL = os.environ.get("API_URL", "http://localhost:8080")
+WAKE_TIMEOUT_SEC = int(os.environ.get("WAKE_TIMEOUT_SEC", "150"))
 
 # ---------------------------------------------------------------------------
 # Look & feel
@@ -48,10 +56,11 @@ st.markdown(
 # State
 # ---------------------------------------------------------------------------
 defaults = {
-    "stage": "upload",  # upload -> preparing -> ready
+    "stage": "upload",  # upload -> ready
     "doc_summary": None,
-    "history": [],  # list of (question, answer_dict)
+    "history": [],  # list of (question, answer_dict, error)
     "error": None,
+    "api_awake": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -59,25 +68,21 @@ for k, v in defaults.items():
 
 
 def reset_all():
+    keep_awake = st.session_state.get("api_awake", False)
     for k, v in defaults.items():
         st.session_state[k] = v
+    st.session_state.api_awake = keep_awake
 
 
-def api_post(path: str, **kwargs):
-    """POST to the API with a generous timeout (the free hosting tier can
-    take up to a minute to wake up if it's been idle)."""
-    with httpx.Client(timeout=180) as client:
-        return client.post(f"{API_URL}{path}", **kwargs)
+def get_client() -> ApiClient:
+    """A client per rerun, carrying the awake flag across reruns."""
+    client = ApiClient(API_URL, wake_timeout_sec=WAKE_TIMEOUT_SEC)
+    client.awake = bool(st.session_state.get("api_awake", False))
+    return client
 
 
-def _friendly_error(response: httpx.Response) -> str:
-    try:
-        detail = response.json().get("detail", "")
-    except Exception:
-        detail = ""
-    if "api key" in detail.lower():
-        return "The server isn't set up with an AI key yet."
-    return "Please try again."
+def remember(client: ApiClient) -> None:
+    st.session_state.api_awake = client.awake
 
 
 # ---------------------------------------------------------------------------
@@ -103,26 +108,30 @@ if st.session_state.stage == "upload":
 
     if uploaded is not None:
         st.session_state.error = None
+        client = get_client()
         with st.status("Reading your document...", expanded=True) as status:
+
+            def note(message: str) -> None:
+                status.update(label=message, state="running")
+
             try:
                 files = {"file": (uploaded.name, uploaded.getvalue(), "application/pdf")}
-                r = api_post("/upload", files=files)
+                r = client.post("/upload", progress=note, files=files)
+
                 if r.status_code != 200:
                     status.update(label="Something went wrong.", state="error")
-                    st.session_state.error = (
-                        f"The upload didn't go through ({r.status_code}). "
-                        f"{_friendly_error(r)}"
-                    )
+                    st.session_state.error = friendly_error(r)
                 else:
                     ingest = r.json()
-                    status.update(label="Document read. Getting ready to answer questions...", state="running")
+                    status.update(
+                        label="Document read. Getting ready to answer questions...",
+                        state="running",
+                    )
 
-                    r2 = api_post("/preprocess")
+                    r2 = client.post("/preprocess", progress=note)
                     if r2.status_code != 200:
                         status.update(label="Something went wrong while preparing.", state="error")
-                        st.session_state.error = (
-                            f"Preparation failed ({r2.status_code}). {_friendly_error(r2)}"
-                        )
+                        st.session_state.error = friendly_error(r2)
                     else:
                         prep = r2.json()
                         status.update(label="Ready!", state="complete")
@@ -134,22 +143,33 @@ if st.session_state.stage == "upload":
                             "faq_count": prep.get("faq_count", 0),
                         }
                         st.session_state.stage = "ready"
+                        remember(client)
                         time.sleep(0.4)
                         st.rerun()
+
+            except ApiUnavailable as e:
+                status.update(label="Couldn't wake the server.", state="error")
+                st.session_state.error = str(e)
             except httpx.TimeoutException:
                 status.update(label="Taking longer than expected.", state="error")
                 st.session_state.error = (
                     "The server didn't respond in time. Free hosting can take a "
-                    "minute to wake up after being idle — please try uploading again."
+                    "minute to wake up after being idle. Please try uploading again."
                 )
             except httpx.RequestError:
                 status.update(label="Couldn't connect.", state="error")
                 st.session_state.error = (
                     "Couldn't reach the server. Please check your connection and try again."
                 )
+            finally:
+                remember(client)
 
     if st.session_state.error:
         st.error(st.session_state.error)
+        if st.button("Try again"):
+            st.session_state.error = None
+            st.session_state.api_awake = False
+            st.rerun()
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Ready to ask
@@ -172,24 +192,36 @@ elif st.session_state.stage == "ready":
     col2.button("Upload a different document", on_click=reset_all, use_container_width=True)
 
     if ask_clicked and question.strip():
+        client = get_client()
         with st.spinner("Thinking..."):
             try:
-                r = api_post("/query", json={"question": question, "pipeline": "sleep_time"})
+                r = client.post("/query", json={"question": question, "pipeline": "sleep_time"})
                 if r.status_code == 200:
-                    result = r.json()
-                    st.session_state.history.insert(0, (question, result, None))
-                else:
-                    st.session_state.history.insert(
-                        0, (question, None, f"Couldn't get an answer ({r.status_code}). {_friendly_error(r)}")
+                    st.session_state.history.insert(0, (question, r.json(), None))
+                elif r.status_code == 400:
+                    # The backend restarted and lost the document it had read.
+                    st.session_state.stage = "upload"
+                    st.session_state.doc_summary = None
+                    st.session_state.error = (
+                        "The server restarted and no longer has your document. "
+                        "Please upload it again."
                     )
+                    remember(client)
+                    st.rerun()
+                else:
+                    st.session_state.history.insert(0, (question, None, friendly_error(r)))
+            except ApiUnavailable as e:
+                st.session_state.history.insert(0, (question, None, str(e)))
             except httpx.TimeoutException:
                 st.session_state.history.insert(
-                    0, (question, None, "That took too long — please try asking again.")
+                    0, (question, None, "That took too long. Please try asking again.")
                 )
             except httpx.RequestError:
                 st.session_state.history.insert(
                     0, (question, None, "Couldn't reach the server. Please try again.")
                 )
+            finally:
+                remember(client)
 
     st.write("")
 

@@ -1,15 +1,53 @@
-name: Keep SleepMind API Warm
+name: Keep SleepMind Warm
+
+# Free Render instances spin down after 15 minutes of inactivity, and the
+# first request after that can be refused at the edge while the instance
+# comes back. GitHub's scheduled runs drift by several minutes, so a single
+# ping every 10 minutes is not reliably inside that 15 minute window. Each
+# run therefore pings repeatedly over ~12 minutes, which keeps coverage
+# dense without scheduling more workflow runs.
 
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Ping health endpoint
+      - name: Ping both services
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://sleepmind-ai-api.onrender.com/health)
-          echo "Health check responded with status: $STATUS"
+          API="https://sleepmind-ai-api.onrender.com/health"
+          DASH="https://sleepmind-ai-dashboard.onrender.com/"
+
+          ping() {
+            url="$1"
+            name="$2"
+            # Retry a few times: a cold start takes 30 to 60 seconds and the
+            # edge may answer 429 or 502 until the instance is listening.
+            for attempt in 1 2 3 4 5; do
+              status=$(curl -sS -o /dev/null -m 90 -w "%{http_code}" "$url" || echo "000")
+              echo "$name attempt $attempt -> $status"
+              if [ "$status" = "200" ]; then
+                return 0
+              fi
+              sleep 15
+            done
+            echo "::warning::$name did not return 200 after 5 attempts"
+            return 0
+          }
+
+          for round in 1 2 3 4; do
+            echo "--- round $round ---"
+            ping "$API" "api"
+            ping "$DASH" "dashboard"
+            if [ "$round" -lt 4 ]; then
+              sleep 170
+            fi
+          done
