@@ -1,53 +1,51 @@
 name: Keep SleepMind Warm
 
-# Free Render instances spin down after 15 minutes of inactivity, and the
-# first request after that can be refused at the edge while the instance
-# comes back. GitHub's scheduled runs drift by several minutes, so a single
-# ping every 10 minutes is not reliably inside that 15 minute window. Each
-# run therefore pings repeatedly over ~12 minutes, which keeps coverage
-# dense without scheduling more workflow runs.
-
+# Ping both Render services often enough to reduce cold starts.
+# Keep each run short so scheduled jobs do not pile up or get cancelled.
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
-
-concurrency:
-  group: keep-warm
-  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 4
     steps:
       - name: Ping both services
+        shell: bash
         run: |
-          API="https://sleepmind-ai-api.onrender.com/health"
-          DASH="https://sleepmind-ai-dashboard.onrender.com/"
-
-          ping() {
+          check_service() {
             url="$1"
             name="$2"
-            # Retry a few times: a cold start takes 30 to 60 seconds and the
-            # edge may answer 429 or 502 until the instance is listening.
+
             for attempt in 1 2 3 4 5; do
-              status=$(curl -sS -o /dev/null -m 90 -w "%{http_code}" "$url" || echo "000")
-              echo "$name attempt $attempt -> $status"
-              if [ "$status" = "200" ]; then
-                return 0
-              fi
-              sleep 15
+              status=$(curl -L -sS -o /dev/null \
+                --connect-timeout 10 \
+                --max-time 20 \
+                -w "%{http_code}" \
+                "$url" || true)
+
+              echo "$name attempt $attempt -> ${status:-000}"
+
+              case "$status" in
+                200|204|301|302|307|308)
+                  return 0
+                  ;;
+              esac
+
+              sleep 10
             done
-            echo "::warning::$name did not return 200 after 5 attempts"
+
+            echo "::warning::$name did not return a healthy HTTP status after 5 attempts"
             return 0
           }
 
-          for round in 1 2 3 4; do
-            echo "--- round $round ---"
-            ping "$API" "api"
-            ping "$DASH" "dashboard"
-            if [ "$round" -lt 4 ]; then
-              sleep 170
-            fi
-          done
+          check_service "https://sleepmind-ai-api.onrender.com/health" "api" &
+          api_pid=$!
+
+          check_service "https://sleepmind-ai-dashboard.onrender.com/" "dashboard" &
+          dash_pid=$!
+
+          wait "$api_pid"
+          wait "$dash_pid"
