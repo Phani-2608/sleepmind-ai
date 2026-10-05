@@ -1,0 +1,89 @@
+name: One-time February to October empty activity
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/empty-activity-feb-oct-2026.yml]
+permissions:
+  contents: write
+concurrency:
+  group: empty-activity-feb-oct-2026
+  cancel-in-progress: false
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Add 750 empty records across February to October and remove this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PYCODE'
+          import base64, calendar, collections, datetime as dt, os, subprocess, tempfile
+          from zoneinfo import ZoneInfo
+          
+          WORKFLOW = '.github/workflows/empty-activity-feb-oct-2026.yml'
+          EXPECTED_BASE = 'c1f54ea385297c69c9da4f426ba5c991a03fa861'
+          REPOSITORY = os.environ['GITHUB_REPOSITORY']
+          SEED = os.environ['GITHUB_SHA']
+          TOKEN = os.environ['GH_TOKEN']
+          MARKER = 'Empty activity record [750-total:2026-02_to_2026-10]'
+          ZONE = ZoneInfo('America/New_York')
+          MONTH_COUNTS = {month:84 if month <= 4 else 83 for month in range(2,11)}
+          CUTOFF = dt.datetime.fromisoformat('2026-10-05T08:11:47-04:00').astimezone(dt.timezone.utc)
+          
+          def git(*args, data=None, env=None):
+              result = subprocess.run(['git', *args], input=data, text=True,
+                                      capture_output=True, env=env)
+              if result.returncode:
+                  raise RuntimeError('Git operation failed: ' + args[0])
+              return result.stdout.strip()
+          
+          with tempfile.TemporaryDirectory() as work:
+              os.chdir(work)
+              git('init', '--bare')
+              remote = 'https://github.com/' + REPOSITORY + '.git'
+              git('remote', 'add', 'origin', remote)
+              header = 'AUTHORIZATION: basic ' + base64.b64encode(('x-access-token:' + TOKEN).encode()).decode()
+              def authenticated(*args):
+                  return git('-c', 'http.https://github.com/.extraheader=' + header, *args)
+              authenticated('fetch', 'origin', 'refs/heads/main:refs/heads/main')
+              assert git('rev-parse', 'main') == SEED, 'Branch moved; stopping to preserve concurrent changes'
+              assert git('rev-parse', SEED + '^') == EXPECTED_BASE, 'Unexpected parent; stopping'
+              assert git('diff', '--name-only', EXPECTED_BASE, SEED) == WORKFLOW, 'Unexpected file changes'
+              tree = git('rev-parse', EXPECTED_BASE + '^{tree}')
+              assert not git('log', '--format=%s', '--fixed-strings', '--grep=' + MARKER, SEED), 'Already generated'
+              identity = os.environ.copy()
+              identity.update(GIT_AUTHOR_NAME='Phanindra Reddy Mathireddy',
+                              GIT_COMMITTER_NAME='Phanindra Reddy Mathireddy',
+                              GIT_AUTHOR_EMAIL='124339885+Phani-2608@users.noreply.github.com',
+                              GIT_COMMITTER_EMAIL='124339885+Phani-2608@users.noreply.github.com')
+              parent = git('commit-tree', tree, '-p', SEED, env=identity,
+                           data='Remove temporary empty-activity workflow; restore original project tree\n')
+              cleanup = parent
+              total = 0
+              for month, count in MONTH_COUNTS.items():
+                  year = 2026
+                  last_day = calendar.monthrange(year, month)[1]
+                  start = dt.datetime(year, month, 1, 12, tzinfo=ZONE).astimezone(dt.timezone.utc)
+                  end = min(dt.datetime(year, month, last_day, 12, tzinfo=ZONE).astimezone(dt.timezone.utc), CUTOFF)
+                  span = int((end - start).total_seconds())
+                  for index in range(count):
+                      stamp = (start + dt.timedelta(seconds=index * span // (count - 1))).astimezone(ZONE).isoformat()
+                      env = identity.copy()
+                      env.update(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
+                      parent = git('commit-tree', tree, '-p', parent, env=env,
+                                   data=f'{MARKER} {year}-{month:02d} {index+1:03d}/{count}\n\nEmpty record with a user-selected historical date. No project files changed.\n')
+                      total += 1
+                  print(f'{year}-{month:02d}: {count} empty commits', flush=True)
+              rows = git('log', '--format=%aI %T', cleanup + '..' + parent).splitlines()
+              counts = collections.Counter(row[:7] for row in rows)
+              expected = {f'2026-{month:02d}':count for month,count in MONTH_COUNTS.items()}
+              assert total == 750 and len(rows) == 750 and counts == expected
+              assert all(row.split()[1] == tree for row in rows)
+              assert all(dt.datetime.fromisoformat(row.split()[0]) <= CUTOFF for row in rows)
+              assert git('diff', '--name-only', EXPECTED_BASE, parent) == ''
+              git('merge-base', '--is-ancestor', SEED, parent)
+              authenticated('push', 'origin', parent + ':refs/heads/main')
+              assert authenticated('ls-remote', 'origin', 'refs/heads/main').split()[0] == parent
+              print('Verified 750 empty commits; all project files exactly preserved. Final SHA: ' + parent)
+          PYCODE
